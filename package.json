@@ -1,0 +1,22 @@
+{
+  "name": "edge-pdf-huaci-translator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Microsoft Edge 扩展：内置 PDF 阅读器 + 划词翻译（选中英文单词 → 点“译” → 中文释义）。",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node tools/vendor-pdfjs.mjs && node tools/make-icons.mjs && node tools/check-pdfjs-contract.mjs",
+    "vendor": "node tools/vendor-pdfjs.mjs",
+    "icons": "node tools/make-icons.mjs",
+    "check:pdfjs": "node tools/check-pdfjs-contract.mjs",
+    "test": "node tests/providers.test.mjs && node tests/e2e.mjs",
+    "test:providers": "node tests/providers.test.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "serve": "node tests/serve.mjs",
+    "pack": "node tools/pack.mjs"
+  }
+}

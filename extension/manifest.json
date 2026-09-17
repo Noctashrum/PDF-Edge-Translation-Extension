@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "PDF 划词翻译",
+  "short_name": "划词翻译",
+  "version": "1.0.0",
+  "description": "读 PDF 时鼠标选中英文单词，出现“译”按钮，点一下即显示中文释义（词性、音标、例句）。",
+  "minimum_chrome_version": "114",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "PDF 划词翻译",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "webRequest",
+    "contextMenus"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*", "file:///*"],
+      "js": ["shared/bubble.js", "content/selection-translate.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "commands": {
+    "translate-selection": {
+      "suggested_key": { "default": "Alt+Shift+T" },
+      "description": "翻译当前选中的文字"
+    }
+  }
+}

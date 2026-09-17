@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF 划词翻译 · 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="page-head">
+        <div class="logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h10M9 3v2c0 4.4-2.2 8-5 9"/><path d="M6 10.5c1.4 2 3.3 3.4 5.5 4.2"/><path d="M13 21l4-10 4 10"/><path d="M14.5 17h5"/></svg>
+        </div>
+        <div>
+          <h1>PDF 划词翻译</h1>
+          <p class="sub">在 PDF 里选中英文单词，点「译」看中文释义。</p>
+        </div>
+      </header>
+
+      <div class="banner" id="welcome" hidden>
+        <strong>装好了，怎么用？</strong>
+        <p>
+          任意打开一个 PDF（或点扩展图标 →「在翻译阅读器中打开」），PDF 会由本扩展自带的阅读器渲染；
+          用鼠标选中英文单词 → 选中处出现蓝色「译」按钮 → 点一下即可看到中文释义、音标、例句。
+        </p>
+        <p class="muted">
+          为什么必须接管 PDF：Edge 内置的 PDF 阅读器是浏览器内部页面，按 Chromium 的安全设计，
+          任何扩展都无法在其中注入脚本、也就拿不到你选中的文字。所以本扩展用 pdf.js
+          自带了一个同等功能的阅读器，命令行里始终可以点「用 Edge 打开」切回原生阅读器。
+        </p>
+      </div>
+
+      <section class="card">
+        <h2>基本</h2>
+        <label class="row">
+          <span class="label">启用扩展<em>总开关，关掉后所有划词与 PDF 接管都会停止</em></span>
+          <input type="checkbox" id="enabled" />
+        </label>
+        <label class="row">
+          <span class="label">自动接管 PDF<em>PDF 用本扩展的阅读器打开，这样才能划词翻译</em></span>
+          <input type="checkbox" id="interceptPdf" />
+        </label>
+        <label class="row">
+          <span class="label">网页上也支持划词<em>普通网页选中文字后同样弹出「译」按钮</em></span>
+          <input type="checkbox" id="enableOnWebPages" />
+        </label>
+        <label class="row">
+          <span class="label">选中即翻译<em>选中后不点按钮，直接出结果</em></span>
+          <input type="checkbox" id="translateOnSelect" />
+        </label>
+        <label class="row">
+          <span class="label">双击单词直接翻译<em>适用于 PDF 阅读器内</em></span>
+          <input type="checkbox" id="translateOnDoubleClick" />
+        </label>
+      </section>
+
+      <section class="card">
+        <h2>翻译</h2>
+        <div class="engines" id="engines"></div>
+        <label class="row">
+          <span class="label">目标语言</span>
+          <select id="targetLang">
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁体中文</option>
+            <option value="en">英文</option>
+          </select>
+        </label>
+        <label class="row">
+          <span class="label">显示音标与发音</span>
+          <input type="checkbox" id="showPhonetic" />
+        </label>
+        <label class="row">
+          <span class="label">显示双语例句</span>
+          <input type="checkbox" id="showExamples" />
+        </label>
+        <div class="row">
+          <span class="label">测试翻译</span>
+          <div class="test-box">
+            <input id="testInput" type="text" value="hello" />
+            <button id="testBtn" class="btn">测试</button>
+          </div>
+        </div>
+        <pre class="test-result" id="testResult" hidden></pre>
+      </section>
+
+      <section class="card">
+        <h2>阅读器</h2>
+        <label class="row">
+          <span class="label">外观主题</span>
+          <select id="viewerTheme">
+            <option value="system">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+        <label class="row">
+          <span class="label">默认缩放</span>
+          <select id="defaultZoom">
+            <option value="auto">自动</option>
+            <option value="page-width">适合宽度</option>
+            <option value="page-fit">适合页面</option>
+            <option value="page-actual">实际大小</option>
+            <option value="1">100%</option>
+            <option value="1.25">125%</option>
+            <option value="1.5">150%</option>
+          </select>
+        </label>
+        <label class="row">
+          <span class="label">记住每份 PDF 的阅读位置</span>
+          <input type="checkbox" id="rememberPosition" />
+        </label>
+      </section>
+
+      <section class="card">
+        <h2>数据与诊断</h2>
+        <div class="row">
+          <span class="label">翻译缓存<em>重复查同一个词直接用缓存，不再联网</em></span>
+          <div class="inline">
+            <span id="cacheCount" class="muted">–</span>
+            <button id="clearCache" class="btn">清空缓存</button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="label">运行状态</span>
+          <span id="diagnostics" class="muted">–</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>隐私</h2>
+        <p class="note">
+          扩展只做两件事：把你选中的文字发给翻译引擎，以及把 PDF 文件读进本地阅读器渲染。
+          没有账号、没有统计、不上传任何浏览记录。翻译缓存保存在本机（chrome.storage.local），
+          可随时清空。默认引擎「有道词典」会把查询的词发给 dict.youdao.com；
+          若把引擎切到 Google 翻译，则会发往 translate.googleapis.com。
+        </p>
+      </section>
+
+      <footer class="page-foot">
+        <span id="version" class="muted"></span>
+        <button id="resetBtn" class="link">恢复默认设置</button>
+      </footer>
+    </div>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
