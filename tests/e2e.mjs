@@ -287,7 +287,7 @@ const BUBBLE_STATE = `(() => {
   const q = (sel) => card.querySelector(sel)?.textContent?.trim() || '';
   return {
     state: 'card',
-    word: q('.pdft-word'),
+    editor: card.querySelector('.pdft-editor')?.value ?? null,
     engine: q('.pdft-engine'),
     phonetics: q('.pdft-phonetics'),
     error: q('.pdft-error'),
@@ -305,6 +305,28 @@ const CLICK_TRANSLATE_BUTTON = `(() => {
   const btn = host?.shadowRoot?.querySelector('.pdft-btn');
   if (!btn) return false;
   btn.click();
+  return true;
+})()`;
+
+/** 点卡片里的操作按钮（翻译 / 扩选整行 / 扩选整段 / 还原） */
+const CLICK_BUBBLE_ACTION = (label) => `(() => {
+  const host = document.querySelector('pdft-bubble-host');
+  const buttons = [...(host?.shadowRoot?.querySelectorAll('.pdft-act') || [])];
+  const btn = buttons.find((b) => (b.textContent || '').trim().startsWith(${JSON.stringify(label)}));
+  if (!btn) return false;
+  btn.click();
+  return true;
+})()`;
+
+/** 改写输入框里的待翻译文字，并按回车提交（走真实键盘事件链路） */
+const SET_BUBBLE_EDITOR = (text) => `(() => {
+  const host = document.querySelector('pdft-bubble-host');
+  const editor = host?.shadowRoot?.querySelector('.pdft-editor');
+  if (!editor) return false;
+  editor.focus();
+  editor.value = ${JSON.stringify(text)};
+  editor.dispatchEvent(new Event('input', { bubbles: true }));
+  editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
   return true;
 })()`;
 
@@ -342,7 +364,7 @@ async function translateFlow(browser, sessionId, { word, prefix }) {
     { timeout: 25_000, label: `${prefix}翻译结果卡片` },
   );
   const hasCjk = /[\u4e00-\u9fff]/.test(JSON.stringify(card));
-  check(`${prefix}卡片显示中文释义`, !card.error && hasCjk, card.error || card.word);
+  check(`${prefix}卡片显示中文释义`, !card.error && hasCjk, card.error || card.editor);
   return card;
 }
 
@@ -433,6 +455,45 @@ async function scenario1PdfTakeover(browser, extId, baseUrl, tabs) {
       check('标注使用的引擎', !!card.engine, card.engine || '无');
       if (card.examples?.length) info('例句：' + card.examples[0].slice(0, 68));
       info('截图: ' + (await screenshot(browser, sid, 'viewer-translate-card.png')));
+
+      /* ── 待翻译文字可编辑 + 扩选整行/整段 ─────────────────────── */
+      const initial = await evalIn(browser, sid, BUBBLE_STATE);
+      check('翻译卡片带可编辑输入框', initial.editor === 'hello', `输入框内容「${initial.editor ?? '无'}」`);
+
+      const lineClicked = await evalIn(browser, sid, CLICK_BUBBLE_ACTION('扩选整行'));
+      const expanded = await pollEval(browser, sid, BUBBLE_STATE, (s) => s.state === 'card' && s.editor === 'hello world', {
+        timeout: 15_000,
+        label: '扩选整行',
+      }).catch(() => null);
+      check(
+        '「扩选整行」把漏掉的词补回来',
+        lineClicked === true && expanded?.editor === 'hello world',
+        `输入框变成「${expanded?.editor ?? '超时'}」`,
+      );
+
+      const submitted = await evalIn(browser, sid, SET_BUBBLE_EDITOR('translation'));
+      const retranslated = await pollEval(
+        browser,
+        sid,
+        BUBBLE_STATE,
+        (s) => s.state === 'card' && s.editor === 'translation' && /[\u4e00-\u9fff]/.test(JSON.stringify(s.meanings || [])),
+        { timeout: 25_000, label: '编辑文字后重译' },
+      ).catch(() => null);
+      check(
+        '手改文字 + 回车能重新翻译',
+        submitted === true && !!retranslated,
+        retranslated
+          ? `translation → ${(retranslated.meanings || []).map((m) => m.pos + m.defs.join('；')).join(' / ').slice(0, 56)}`
+          : '超时',
+      );
+      info('截图: ' + (await screenshot(browser, sid, 'viewer-edit-translate.png')));
+
+      const restored = await evalIn(browser, sid, CLICK_BUBBLE_ACTION('还原'));
+      const back = await pollEval(browser, sid, BUBBLE_STATE, (s) => s.state === 'card' && s.editor === 'hello', {
+        timeout: 15_000,
+        label: '还原成原文',
+      }).catch(() => null);
+      check('「还原」回到鼠标选中的原文', restored === true && back?.editor === 'hello', `输入框「${back?.editor ?? '超时'}」`);
     }
 
     // 翻页
