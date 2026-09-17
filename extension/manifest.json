@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "PDF 划词翻译",
   "short_name": "划词翻译",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "读 PDF 时鼠标选中英文单词，出现“译”按钮，点一下即显示中文释义（词性、音标、例句）。",
   "minimum_chrome_version": "114",
   "icons": {

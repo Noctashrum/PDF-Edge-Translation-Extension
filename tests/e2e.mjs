@@ -282,22 +282,50 @@ const BUBBLE_STATE = `(() => {
   const root = host && host.shadowRoot;
   if (!root) return { state: 'no-host' };
   const btn = root.querySelector('.pdft-btn');
-  const card = root.querySelector('.pdft-card');
-  if (!card) return { state: btn ? 'button' : 'idle' };
-  const q = (sel) => card.querySelector(sel)?.textContent?.trim() || '';
-  return {
-    state: 'card',
-    editor: card.querySelector('.pdft-editor')?.value ?? null,
-    engine: q('.pdft-engine'),
-    phonetics: q('.pdft-phonetics'),
-    error: q('.pdft-error'),
-    translation: q('.pdft-sentence'),
-    meanings: [...card.querySelectorAll('.pdft-mean')].map((m) => ({
-      pos: m.querySelector('.pdft-pos')?.textContent?.trim() || '',
-      defs: [...m.querySelectorAll('.pdft-def')].map((d) => d.textContent.trim()),
-    })),
-    examples: [...card.querySelectorAll('.pdft-ex .en')].map((e) => e.textContent.trim()),
+  const describe = (card) => {
+    const q = (sel) => card.querySelector(sel)?.textContent?.trim() || '';
+    const r = card.getBoundingClientRect();
+    return {
+      editor: card.querySelector('.pdft-editor')?.value ?? null,
+      engine: q('.pdft-engine'),
+      phonetics: q('.pdft-phonetics'),
+      error: q('.pdft-error'),
+      translation: q('.pdft-sentence'),
+      meanings: [...card.querySelectorAll('.pdft-mean')].map((m) => ({
+        pos: m.querySelector('.pdft-pos')?.textContent?.trim() || '',
+        defs: [...m.querySelectorAll('.pdft-def')].map((d) => d.textContent.trim()),
+      })),
+      examples: [...card.querySelectorAll('.pdft-ex .en')].map((e) => e.textContent.trim()),
+      pinned: card.classList.contains('pinned'),
+      left: Math.round(r.left),
+      top: Math.round(r.top),
+    };
   };
+  const cards = [...root.querySelectorAll('.pdft-card')].map(describe);
+  return {
+    state: cards.length ? 'card' : btn ? 'button' : 'idle',
+    hasButton: !!btn,
+    count: cards.length,
+    cards,
+    stack: root.querySelector('.pdft-stack .pdft-stack-count')?.textContent || null,
+    ...(cards[0] || {}),
+  };
+})()`;
+
+/** 拖动卡片手柄：返回手柄中心的屏幕坐标 */
+const GRIP_POINT = `(() => {
+  const host = document.querySelector('pdft-bubble-host');
+  const grip = host?.shadowRoot?.querySelector('.pdft-card .pdft-grip');
+  if (!grip) return null;
+  const r = grip.getBoundingClientRect();
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+})()`;
+
+const CLICK_CLOSE_ALL = `(() => {
+  const btn = document.querySelector('pdft-bubble-host')?.shadowRoot?.querySelector('.pdft-stack button');
+  if (!btn) return false;
+  btn.click();
+  return true;
 })()`;
 
 const CLICK_TRANSLATE_BUTTON = `(() => {
@@ -348,11 +376,11 @@ async function translateFlow(browser, sessionId, { word, prefix }) {
   check(`${prefix}选中 ${word}`, sel.ok, sel.ok ? `选中「${sel.selected}」` : sel.reason);
   if (!sel.ok) return null;
 
-  const beforeClick = await pollEval(browser, sessionId, BUBBLE_STATE, (s) => s.state === 'button', {
+  const beforeClick = await pollEval(browser, sessionId, BUBBLE_STATE, (s) => s.hasButton === true, {
     timeout: 8000,
     label: `${prefix}出现「译」按钮`,
   });
-  check(`${prefix}出现「译」按钮`, beforeClick.state === 'button');
+  check(`${prefix}出现「译」按钮`, beforeClick.hasButton === true);
 
   check(`${prefix}点击「译」按钮`, (await evalIn(browser, sessionId, CLICK_TRANSLATE_BUTTON)) === true);
 
@@ -494,6 +522,54 @@ async function scenario1PdfTakeover(browser, extId, baseUrl, tabs) {
         label: '还原成原文',
       }).catch(() => null);
       check('「还原」回到鼠标选中的原文', restored === true && back?.editor === 'hello', `输入框「${back?.editor ?? '超时'}」`);
+
+      /* ── 拖动固定 + 同时多开 ─────────────────────────────────── */
+      const beforeDrag = await evalIn(browser, sid, BUBBLE_STATE);
+      const grip = await evalIn(browser, sid, GRIP_POINT);
+      check('卡片带拖动手柄', !!grip, grip ? `手柄在 (${grip.x}, ${grip.y})` : '没找到 .pdft-grip');
+
+      if (grip) {
+        const mouse = (type, x, y, buttons) =>
+          browser.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons, clickCount: 1 }, sid);
+        await mouse('mousePressed', grip.x, grip.y, 1);
+        await mouse('mouseMoved', grip.x + 40, grip.y + 10, 1);
+        await mouse('mouseMoved', grip.x + 130, grip.y + 24, 1);
+        await mouse('mouseReleased', grip.x + 130, grip.y + 24, 0);
+        const dragged = await pollEval(browser, sid, BUBBLE_STATE, (s) => s.cards?.[0]?.pinned === true, {
+          timeout: 6000,
+          label: '拖动后钉住',
+        }).catch(() => null);
+        const moved = dragged ? dragged.cards[0].left - beforeDrag.cards[0].left : 0;
+        check('拖动卡片后固定在新位置', !!dragged && Math.abs(moved) > 50, dragged ? `横向移动 ${moved}px，pinned=${dragged.cards[0].pinned}` : '没钉住');
+      }
+
+      // 再翻一个词：应该多出一张卡片，而不是把刚才那张替换掉
+      const picked = await evalIn(browser, sid, SELECT_WORD('world'));
+      check('再选中另一个词 world', picked.ok, picked.ok ? `选中「${picked.selected}」` : picked.reason);
+      await pollEval(browser, sid, BUBBLE_STATE, (s) => s.hasButton, { timeout: 8000, label: '第二个「译」按钮' });
+      await evalIn(browser, sid, CLICK_TRANSLATE_BUTTON);
+      const two = await pollEval(
+        browser,
+        sid,
+        BUBBLE_STATE,
+        (s) => s.count >= 2 && s.cards.some((c) => c.editor === 'world' && (c.meanings?.length || c.translation)),
+        { timeout: 25_000, label: '第二张卡片' },
+      ).catch(() => null);
+      check('可以同时开多张卡片', two?.count === 2, two ? `共 ${two.count} 张：${two.cards.map((c) => c.editor).join(' / ')}` : '超时');
+      check(
+        '先开的那张没被顶掉、且保持固定',
+        two?.cards?.[0]?.editor === 'hello' && two.cards[0].pinned === true,
+        two ? `第 1 张=「${two.cards[0].editor}」 pinned=${two.cards[0].pinned}` : '',
+      );
+      check('出现「N 张卡片 · 全部关闭」角标', /2 张卡片/.test(two?.stack || ''), two?.stack || '无角标');
+      info('截图: ' + (await screenshot(browser, sid, 'viewer-multi-card.png')));
+
+      const closedAll = await evalIn(browser, sid, CLICK_CLOSE_ALL);
+      const none = await pollEval(browser, sid, BUBBLE_STATE, (s) => s.count === 0, {
+        timeout: 6000,
+        label: '全部关闭',
+      }).catch(() => null);
+      check('「全部关闭」一次收掉所有卡片', closedAll === true && none?.count === 0, none ? `剩余 ${none.count} 张` : '超时');
     }
 
     // 翻页

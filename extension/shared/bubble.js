@@ -6,6 +6,12 @@
  *   1) 普通网页（content script 隔离世界，见 content/selection-translate.js）
  *   2) 本扩展的 PDF 阅读器页（viewer/viewer.html 里用 <script src> 直接引入）
  *
+ * 能力：
+ *   - 卡片顶部文字可直接编辑，回车重译（PDF 框选漏字时手动补）；
+ *   - 「扩选整行 / 扩选整段」按视觉行把 PDF 文本层片段重新拼起来；
+ *   - 卡片可以拖动左上角手柄「钉」在任意位置，且支持同时开多张（互不干扰）；
+ *   - 每张卡片独立保存文档选区 / 请求，慢响应不会覆盖新结果。
+ *
  * 实现要点：
  *   - 挂在 Shadow DOM 里，页面样式无法污染，也无法被页面 reset 掉；
  *   - 所有结果文本一律用 DOM API 写入（textContent），不拼 innerHTML，避免词典内容注入；
@@ -15,6 +21,7 @@
   'use strict';
 
   const HOST_TAG = 'pdft-bubble-host';
+  const MAX_CARDS = 6; // 同时最多几张卡片，超了自动关掉最早的
 
   const CSS = `
   :host {
@@ -107,13 +114,34 @@
   }
   .pdft-card::-webkit-scrollbar { width: 8px; }
   .pdft-card::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  /* 拖动过（钉住）的卡片给一圈细蓝边，和「跟着选区跑」的卡片区分开 */
+  .pdft-card.pinned {
+    box-shadow: 0 14px 44px rgba(15, 23, 42, .24), 0 0 0 1.5px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  .pdft-card.dragging { cursor: grabbing; }
+  .pdft-card.dragging * { cursor: grabbing !important; }
 
   .pdft-head {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 11px 12px 0;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 10px 12px 0;
   }
+  .pdft-grip {
+    flex: none;
+    width: 16px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--fg-dim);
+    cursor: grab;
+    touch-action: none;
+  }
+  .pdft-grip:hover { color: var(--accent); }
+  .pdft-grip svg { width: 12px; height: 12px; }
   .pdft-close {
     margin-left: auto;
     flex: none;
@@ -125,6 +153,76 @@
   }
   .pdft-close:hover { background: var(--chip); color: var(--fg); }
   .pdft-close svg { width: 14px; height: 14px; }
+
+  /* 可编辑的待翻译文字：平时像一个标题，点进去就是输入框 */
+  .pdft-editor {
+    flex: 1;
+    min-width: 0;
+    min-height: 26px;
+    max-height: 116px;
+    padding: 3px 5px;
+    font-family: inherit;
+    font-size: 15.5px;
+    font-weight: 700;
+    line-height: 1.35;
+    color: var(--fg);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    resize: none;
+    overflow: auto;
+    word-break: break-word;
+    cursor: text;
+  }
+  .pdft-editor::placeholder { font-weight: 400; color: var(--fg-dim); }
+  .pdft-editor:hover { background: var(--chip); }
+  .pdft-editor:focus { outline: none; background: var(--chip); border-color: var(--accent); }
+
+  .pdft-editbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 12px 0;
+  }
+  .pdft-act {
+    height: 24px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg-dim);
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .pdft-act:hover { color: var(--accent); border-color: var(--accent); }
+  .pdft-act.primary {
+    background: var(--accent);
+    border-color: transparent;
+    color: #fff;
+    font-weight: 600;
+  }
+  .pdft-act.primary:hover { filter: brightness(1.08); }
+
+  /* 右侧提示：没改过时告诉用户“这段文字可以直接编辑”，改过就提示回车重译 */
+  .pdft-tip {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--fg-dim);
+    white-space: nowrap;
+  }
+
+  .pdft-notice {
+    margin: 7px 12px 0;
+    padding: 5px 8px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 12px;
+  }
 
   .pdft-phonetics {
     display: flex; flex-wrap: wrap; gap: 4px 12px;
@@ -220,79 +318,32 @@
   .pdft-error .retry { margin-left: 6px; }
   @media (prefers-color-scheme: dark) { .pdft-error { color: #ff8a80; } }
 
-  /* ── 可编辑的待翻译文字 ───────────────────────────────────── */
-  /* 头部改成输入框：平时看着像标题，点进去就能改 */
-  .pdft-head { align-items: flex-start; }
-  .pdft-editor {
-    flex: 1;
-    min-width: 0;
-    min-height: 26px;
-    max-height: 116px;
-    padding: 3px 5px;
-    font-family: inherit;
-    font-size: 15.5px;
-    font-weight: 700;
-    line-height: 1.35;
-    color: var(--fg);
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 7px;
-    resize: none;
-    overflow: auto;
-    word-break: break-word;
-    cursor: text;
-  }
-  .pdft-editor::placeholder { font-weight: 400; color: var(--fg-dim); }
-  .pdft-editor:hover { background: var(--chip); }
-  .pdft-editor:focus { outline: none; background: var(--chip); border-color: var(--accent); }
+  .pdft-result:empty { display: none; }
 
-  .pdft-editbar {
+  /* ── 多开时的角标：显示卡片数 + 一键全关 ─────────────────── */
+  .pdft-stack {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    z-index: 9;
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
-    padding: 7px 12px 0;
-  }
-  .pdft-act {
-    height: 24px;
-    padding: 0 8px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
+    gap: 10px;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: 999px;
     background: var(--bg);
     color: var(--fg-dim);
-    font-family: inherit;
+    box-shadow: var(--shadow);
     font-size: 12px;
-    line-height: 1;
-    white-space: nowrap;
-    cursor: pointer;
+    animation: pdft-pop .14s ease-out;
+    user-select: none;
   }
-  .pdft-act:hover { color: var(--accent); border-color: var(--accent); }
-  .pdft-act.primary {
-    background: var(--accent);
-    border-color: transparent;
-    color: #fff;
-    font-weight: 600;
+  .pdft-stack button {
+    border: 0; background: none; padding: 0;
+    color: var(--accent); font: inherit; cursor: pointer;
   }
-  .pdft-act.primary:hover { filter: brightness(1.08); }
-
-  /* 右侧提示：没改过时告诉用户“这段文字可以直接编辑”，改过就提示回车重译 */
-  .pdft-tip {
-    margin-left: auto;
-    font-size: 11px;
-    color: var(--fg-dim);
-    white-space: nowrap;
-  }
-
-  .pdft-notice {
-    margin: 7px 12px 0;
-    padding: 5px 8px;
-    border-radius: 6px;
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-size: 12px;
-  }
-
-  .pdft-result:empty { display: none; }
+  .pdft-stack button:hover { text-decoration: underline; }
   `;
 
   /* ── 小工具 ─────────────────────────────────────────────────── */
@@ -315,6 +366,8 @@
     return node;
   }
 
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
+
   const ICON = {
     translate:
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h10M9 3v2c0 4.4-2.2 8-5 9"/><path d="M6 10.5c1.4 2 3.3 3.4 5.5 4.2"/><path d="M13 21l4-10 4 10"/><path d="M14.5 17h5"/></svg>',
@@ -322,6 +375,8 @@
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     speaker:
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4V5z"/><path d="M16 8.5a4.5 4.5 0 0 1 0 7"/><path d="M19 6a8 8 0 0 1 0 12"/></svg>',
+    grip:
+      '<svg viewBox="0 0 12 12" fill="currentColor"><circle cx="4" cy="2.5" r="1.15"/><circle cx="8" cy="2.5" r="1.15"/><circle cx="4" cy="6" r="1.15"/><circle cx="8" cy="6" r="1.15"/><circle cx="4" cy="9.5" r="1.15"/><circle cx="8" cy="9.5" r="1.15"/></svg>',
   };
 
   /** 把一个 rect 摆到可视区内（优先在锚点上方） */
@@ -507,260 +562,49 @@
     return { text, range: out, lines: chosen.length };
   }
 
-  /* ── 主组件 ─────────────────────────────────────────────────── */
-  class TranslateBubble {
+  /* ── 一张翻译卡片 ─────────────────────────────────────────────
+   * 每张卡片自己保存：待翻译文字、文档选区、请求序号、位置与钉住状态。
+   * 关掉一张不影响其它卡片。
+   */
+  class BubbleCard {
     /**
-     * @param {object} opts
-     * @param {(text: string) => Promise<{ok: boolean, result?: object, error?: string}>} opts.onLookup
-     * @param {() => Promise<object>} [opts.loadSettings]
+     * @param {TranslateBubble} bubble
+     * @param {{text: string, anchor: object, auto?: boolean, sourceRange?: Range|null}} init
      */
-    constructor(opts = {}) {
-      this.opts = opts;
-      this.onLookup = opts.onLookup;
-      this.settings = { maxSelectionLength: 600, showExamples: true, showPhonetic: true, viewerTheme: 'system' };
-      this.anchor = null; // 当前选区的 rect
-      this.currentText = '';
-      this.open = false;
-      this.destroyed = false;
-      this._lastRange = null; // 当前（可能被扩选过的）选区
-      this._sourceRange = null; // 鼠标最初选中的范围，供「还原」用
-      this._sourceText = ''; // 鼠标最初选中的文字，用来判断输入框有没有被改过
-      this._reqSeq = 0; // 连续重译时只认最后一次请求
-      this._noticeTimer = null;
-      // 卡片内部元素，见 _ensureCard
-      this.card = null;
-      this.editor = null;
-      this.resultBox = null;
-      this.translateBtn = null;
-      this.noticeEl = null;
+    constructor(bubble, { text, anchor, auto = false, sourceRange = null }) {
+      this.bubble = bubble;
+      this.auto = auto;
+      this.anchor = anchor;
+      this.sourceText = text;
+      this.sourceRange = sourceRange ?? null;
+      this.lastRange = sourceRange ? sourceRange.cloneRange() : null;
+      this.seq = 0;
+      this.closed = false;
+      this.pinned = false; // 拖动过就钉住，不再跟着选区跑
+      this.offset = { dx: 0, dy: 0 }; // 新卡片和旧卡片重叠时的错位
+      this.drag = null;
 
-      this.host = document.createElement(HOST_TAG);
-      this.host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483600;';
-      this.shadow = this.host.attachShadow({ mode: 'open' });
-      this.shadow.append(el('style', { text: CSS }));
-      this.layer = el('div', { class: 'pdft-layer' });
-      this.shadow.append(this.layer);
-      (document.body || document.documentElement).append(this.host);
-
-      this._onMouseUp = this._onMouseUp.bind(this);
-      this._onMouseDown = this._onMouseDown.bind(this);
-      this._onKeyDown = this._onKeyDown.bind(this);
-      this._onViewportChange = this._onViewportChange.bind(this);
+      this.el = this._build();
+      this.editor.value = text;
+      this._autoGrow();
+      this._syncDirty();
+      this.bubble.layer.append(this.el);
+      this.placeAt(anchor);
     }
 
-    async init() {
-      if (this.opts.loadSettings) {
-        try {
-          const s = await this.opts.loadSettings();
-          if (s) this.settings = { ...this.settings, ...s };
-        } catch {
-          /* 用默认值 */
-        }
-      }
-      this.applyTheme();
-      return this;
+    get settings() {
+      return this.bubble.settings;
     }
 
-    applyTheme() {
-      const t = this.settings.viewerTheme;
-      if (t === 'light' || t === 'dark') this.layer.dataset.theme = t;
-      else delete this.layer.dataset.theme;
-    }
-
-    updateSettings(patch) {
-      this.settings = { ...this.settings, ...(patch || {}) };
-      this.applyTheme();
-    }
-
-    get enabled() {
-      return this.settings.enabled !== false;
-    }
-
-    attach() {
-      document.addEventListener('mouseup', this._onMouseUp, true);
-      document.addEventListener('mousedown', this._onMouseDown, true);
-      document.addEventListener('keydown', this._onKeyDown, true);
-      window.addEventListener('scroll', this._onViewportChange, true);
-      window.addEventListener('resize', this._onViewportChange, true);
-      return this;
-    }
-
-    destroy() {
-      this.destroyed = true;
-      clearTimeout(this._autoTimer);
-      clearTimeout(this._noticeTimer);
-      document.removeEventListener('mouseup', this._onMouseUp, true);
-      document.removeEventListener('mousedown', this._onMouseDown, true);
-      document.removeEventListener('keydown', this._onKeyDown, true);
-      window.removeEventListener('scroll', this._onViewportChange, true);
-      window.removeEventListener('resize', this._onViewportChange, true);
-      this.host.remove();
-    }
-
-    /* ── 事件 ─────────────────────────────────────────────────── */
-    _inside(event) {
-      return event.composedPath ? event.composedPath().includes(this.host) : false;
-    }
-
-    _onMouseUp(event) {
-      if (this.destroyed || event.button !== 0) return;
-      if (this._inside(event)) return;
-      // 等浏览器把选区更新完
-      setTimeout(() => this._handleSelection(event), 0);
-    }
-
-    _onMouseDown(event) {
-      if (this.destroyed || this._inside(event)) return;
-      this.hideButton();
-      if (this.open) this.hideCard();
-    }
-
-    _onKeyDown(event) {
-      if (event.key !== 'Escape') return;
-      // 正在输入框里打字时，Esc 只退出输入，不关卡片
-      const target = event.composedPath?.()[0];
-      if (target && (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT')) return;
-      this.hideButton();
-      this.hideCard();
-    }
-
-    _onViewportChange() {
-      if (!this.open) {
-        this.hideButton();
-        return;
-      }
-      // 卡片打开时跟随选区；选区没了就收起来
-      const rect = this._liveSelectionRect();
-      if (rect) place(this.card, rect, { center: false });
-      else this.hideCard();
-    }
-
-    _liveSelectionRect() {
-      try {
-        const sel = window.getSelection();
-        if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
-        const r = sel.getRangeAt(0).getBoundingClientRect();
-        return r.width || r.height ? r : null;
-      } catch {
-        return null;
-      }
-    }
-
-    _handleSelection(event) {
-      if (this.destroyed || !this.enabled) return;
-      const sel = window.getSelection();
-      if (!sel || sel.isCollapsed || !sel.rangeCount) return;
-      const text = cleanText(sel.toString());
-      if (!text) return;
-
-      // 光标的落点必须在选区附近，避免键盘/程序化选区误触发
-      const rect = this._liveSelectionRect();
-      if (!rect) return;
-      if (event && (event.clientX || event.clientY)) {
-        const pad = 24;
-        const near =
-          event.clientY >= rect.top - pad &&
-          event.clientY <= rect.bottom + pad &&
-          event.clientX >= rect.left - pad &&
-          event.clientX <= rect.right + pad;
-        if (!near) return;
-      }
-
-      const range = sel.getRangeAt(0);
-      this._lastRange = range.cloneRange();
-      this._sourceRange = range.cloneRange();
-      this._sourceText = text;
-      this.showButton(text, rect);
-    }
-
-    /** 供右键菜单 / 快捷键使用：直接对当前选区弹卡片 */
-    translateCurrentSelection() {
-      const sel = window.getSelection();
-      let text = cleanText(sel?.toString());
-      let rect = this._liveSelectionRect();
-      const range = this._liveSelectionRange();
-      if (range) {
-        this._lastRange = range.cloneRange();
-        this._sourceRange = range.cloneRange();
-      }
-      if (!text && this.currentText) {
-        text = this.currentText;
-        rect = this.anchor;
-      }
-      if (!text) return false;
-      if (!rect) {
-        rect = { left: window.innerWidth / 2 - 60, top: 80, bottom: 104, width: 120, height: 24 };
-      }
-      this._sourceText = text;
-      this.hideButton();
-      void this.translate(text, rect);
-      return true;
-    }
-
-    /* ── 按钮 ─────────────────────────────────────────────────── */
-    showButton(text, rect) {
-      if (!this.enabled) return;
-      this.currentText = text;
-      this.anchor = rect;
-      this.hideButton();
-      const btn = el(
-        'button',
-        {
-          class: 'pdft-btn',
-          type: 'button',
-          title: `翻译“${text.length > 24 ? text.slice(0, 24) + '…' : text}”`,
-          // 阻止默认行为，避免点击按钮时页面选中的高亮被清掉
-          onmousedown: (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-          },
-        },
-        [el('span', { html: ICON.translate }), el('span', { text: '译' })],
-      );
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.hideButton();
-        void this.translate(text, rect);
+    /* ── 骨架 ─────────────────────────────────────────────────── */
+    _build() {
+      const grip = el('button', {
+        class: 'pdft-grip',
+        type: 'button',
+        html: ICON.grip,
+        title: '按住拖动：把卡片钉在任意位置（多开时会很有用）',
       });
-      this.button = btn;
-      this.layer.append(btn);
-      place(btn, rect, { center: true });
-
-      if (this.settings.translateOnSelect) {
-        clearTimeout(this._autoTimer);
-        this._autoTimer = setTimeout(() => {
-          this.hideButton();
-          void this.translate(text, rect);
-        }, 260);
-      }
-    }
-
-    hideButton() {
-      clearTimeout(this._autoTimer);
-      if (this.button) {
-        this.button.remove();
-        this.button = null;
-      }
-    }
-
-    /* ── 卡片 ─────────────────────────────────────────────────── */
-    hideCard() {
-      if (this.card) {
-        this.card.remove();
-        this.card = null;
-      }
-      this.editor = null;
-      this.resultBox = null;
-      this.translateBtn = null;
-      this.noticeEl = null;
-      this.tipEl = null;
-      this.open = false;
-    }
-
-    /** 搭卡片骨架：可编辑文字框 + 操作按钮 + 结果区；重译时只换结果区，不动输入框 */
-    _ensureCard(rect) {
-      if (this.card) return this.card;
+      this.grip = grip;
 
       const editor = el('textarea', {
         class: 'pdft-editor',
@@ -782,15 +626,16 @@
           }
         },
       });
+      this.editor = editor;
 
       const close = el('button', {
         class: 'pdft-close',
         type: 'button',
-        title: '关闭 (Esc)',
+        title: '关闭这张卡片',
         html: ICON.close,
         onclick: (event) => {
           event.stopPropagation();
-          this.hideCard();
+          this.bubble.removeCard(this);
         },
       });
 
@@ -801,48 +646,136 @@
         title: '翻译输入框里的文字（回车）',
         onclick: () => this._submitEditor(),
       });
-      const lineBtn = el('button', {
-        class: 'pdft-act',
-        type: 'button',
-        text: '扩选整行',
-        title: '把选区补成完整的一行（PDF 文本层是按词切分的，鼠标框选容易漏字）',
-        onclick: () => this._expand('line'),
-      });
-      const paraBtn = el('button', {
-        class: 'pdft-act',
-        type: 'button',
-        text: '扩选整段',
-        title: '把选区补成完整的一段',
-        onclick: () => this._expand('paragraph'),
-      });
-      const restoreBtn = el('button', {
-        class: 'pdft-act',
-        type: 'button',
-        text: '还原',
-        title: '回到鼠标选中的原文',
-        onclick: () => this._restoreSource(),
-      });
+      this.translateBtn = translateBtn;
 
       const tip = el('span', { class: 'pdft-tip', text: '文字可编辑' });
+      this.tipEl = tip;
 
       const card = el('div', { class: 'pdft-card' }, [
-        el('div', { class: 'pdft-head' }, [editor, close]),
-        el('div', { class: 'pdft-editbar' }, [translateBtn, lineBtn, paraBtn, restoreBtn, tip]),
+        el('div', { class: 'pdft-head' }, [grip, editor, close]),
+        el('div', { class: 'pdft-editbar' }, [
+          translateBtn,
+          el('button', {
+            class: 'pdft-act',
+            type: 'button',
+            text: '扩选整行',
+            title: '把选区补成完整的一行（PDF 文本层是按词切分的，鼠标框选容易漏字）',
+            onclick: () => this._expand('line'),
+          }),
+          el('button', {
+            class: 'pdft-act',
+            type: 'button',
+            text: '扩选整段',
+            title: '把选区补成完整的一段',
+            onclick: () => this._expand('paragraph'),
+          }),
+          el('button', {
+            class: 'pdft-act',
+            type: 'button',
+            text: '还原',
+            title: '回到鼠标选中的原文',
+            onclick: () => this._restoreSource(),
+          }),
+          tip,
+        ]),
         el('div', { class: 'pdft-notice', hidden: true }),
         el('div', { class: 'pdft-result' }),
       ]);
 
-      this.card = card;
-      this.editor = editor;
-      this.translateBtn = translateBtn;
-      this.tipEl = tip;
       this.noticeEl = card.querySelector('.pdft-notice');
       this.resultBox = card.querySelector('.pdft-result');
-      this.layer.append(card);
-      place(card, rect, { center: false });
+
+      // 点卡片任意位置把它提到最上层（多开时方便）
+      card.addEventListener('pointerdown', () => this.bubble.bringToFront(this));
+      this._bindDrag(grip);
       return card;
     }
 
+    /* ── 位置 ─────────────────────────────────────────────────── */
+    /** 按锚点摆放（钉住的卡片不动）；offset 是新卡片避让旧卡片的错位 */
+    placeAt(anchor) {
+      if (anchor) this.anchor = anchor;
+      if (this.pinned || this.drag || !this.anchor) return;
+      place(this.el, this.anchor, { center: false });
+      if (this.offset.dx || this.offset.dy) {
+        const left = clamp((parseFloat(this.el.style.left) || 0) + this.offset.dx, 8, window.innerWidth - 40);
+        const top = clamp((parseFloat(this.el.style.top) || 0) + this.offset.dy, 8, window.innerHeight - 30);
+        this.el.style.left = `${Math.round(left)}px`;
+        this.el.style.top = `${Math.round(top)}px`;
+      }
+    }
+
+    /** 文档里对应选区现在还在不在？在的话返回它当前的屏幕位置 */
+    liveRect() {
+      for (const range of [this.lastRange, this.sourceRange]) {
+        try {
+          if (!range || !range.startContainer?.isConnected) continue;
+          const rect = range.getBoundingClientRect();
+          if (rect && (rect.width || rect.height)) return rect;
+        } catch {
+          /* 忽略：PDF 重绘后 range 可能失效 */
+        }
+      }
+      return null;
+    }
+
+    /* ── 拖动 ─────────────────────────────────────────────────── */
+    _bindDrag(grip) {
+      grip.addEventListener('pointerdown', (event) => {
+        if (event.button !== 0 || this.closed) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.bubble.bringToFront(this);
+
+        const box = this.el.getBoundingClientRect();
+        const start = { x: event.clientX, y: event.clientY, left: box.left, top: box.top };
+        let moved = false;
+
+        const onMove = (moveEvent) => {
+          const dx = moveEvent.clientX - start.x;
+          const dy = moveEvent.clientY - start.y;
+          if (!moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+          if (!moved) {
+            moved = true;
+            this.el.classList.add('dragging');
+          }
+          this.el.style.left = `${Math.round(clamp(start.left + dx, 4, window.innerWidth - 60))}px`;
+          this.el.style.top = `${Math.round(clamp(start.top + dy, 4, window.innerHeight - 32))}px`;
+        };
+
+        const onUp = () => {
+          window.removeEventListener('pointermove', onMove, true);
+          window.removeEventListener('pointerup', onUp, true);
+          window.removeEventListener('pointercancel', onUp, true);
+          this.el.classList.remove('dragging');
+          if (!moved) return;
+          // 拖过就钉住：不再跟着选区/滚动跑，方便一边留着对比
+          this.pinned = true;
+          this.offset = { dx: 0, dy: 0 };
+          this.el.classList.add('pinned');
+          if (this._unpinHintTimer) clearTimeout(this._unpinHintTimer);
+          this._flash('已固定在这里；双击手柄可以取消固定', 3200);
+        };
+
+        window.addEventListener('pointermove', onMove, true);
+        window.addEventListener('pointerup', onUp, true);
+        window.addEventListener('pointercancel', onUp, true);
+      });
+
+      // 双击手柄：取消固定，让卡片重新跟着选区
+      grip.addEventListener('dblclick', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!this.pinned) return;
+        this.pinned = false;
+        this.el.classList.remove('pinned');
+        this._flash('已取消固定，重新跟随选区');
+        const rect = this.liveRect();
+        this.placeAt(rect || this.anchor);
+      });
+    }
+
+    /* ── 输入框 ───────────────────────────────────────────────── */
     /** 输入框跟着内容长高（最多 116px，再多就内部滚动） */
     _autoGrow() {
       const editor = this.editor;
@@ -854,14 +787,14 @@
     /** 文字被改过时把「翻译」按钮点亮，并换掉右侧提示 */
     _syncDirty() {
       if (!this.translateBtn) return;
-      const dirty = (this.editor?.value ?? '') !== (this._sourceText ?? '');
+      const dirty = (this.editor?.value ?? '') !== (this.sourceText ?? '');
       this.translateBtn.classList.toggle('primary', dirty);
       if (this.tipEl) this.tipEl.textContent = dirty ? '回车重译' : '文字可编辑';
     }
 
     _flash(message, ms = 2800) {
       const node = this.noticeEl;
-      if (!node) return;
+      if (!node || this.closed) return;
       node.textContent = message;
       node.hidden = false;
       clearTimeout(this._noticeTimer);
@@ -881,14 +814,14 @@
     }
 
     _restoreSource() {
-      if (!this._sourceText) return;
-      if (this._sourceRange && this._rangeAlive(this._sourceRange)) this._applyRange(this._sourceRange);
-      void this.translate(this._sourceText, this.anchor, { setEditor: true });
+      if (!this.sourceText) return;
+      if (this.sourceRange && this._rangeAlive(this.sourceRange)) this._applyRange(this.sourceRange);
+      void this.translate(this.sourceText, this.anchor, { setEditor: true });
     }
 
     /** 扩选整行 / 整段：把没选全的部分补回来，然后立刻重译 */
     _expand(mode) {
-      const base = [this._lastRange, this._sourceRange, this._liveSelectionRange()].find(
+      const base = [this.lastRange, this.sourceRange, this._liveSelectionRange()].find(
         (range) => range && this._rangeAlive(range),
       );
       if (!base) {
@@ -922,13 +855,13 @@
       }
     }
 
-    /** 把页面选区同步成给定 range（高亮会一起扩出来），并更新气泡锚点 */
+    /** 把页面选区同步成给定 range（高亮会一起扩出来），并更新锚点 */
     _applyRange(range) {
       try {
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
-        this._lastRange = range.cloneRange();
+        this.lastRange = range.cloneRange();
         const rect = range.getBoundingClientRect();
         if (rect && (rect.width || rect.height)) this.anchor = rect;
       } catch {
@@ -936,41 +869,42 @@
       }
     }
 
+    /* ── 翻译与渲染 ───────────────────────────────────────────── */
     /**
-     * 翻译一段文字并渲染结果。
      * @param {string} text 要翻译的文字（原样显示在输入框里，过长只截断发给引擎）
-     * @param {object} rect 气泡锚点
-     * @param {{setEditor?: boolean}} opts setEditor=false 表示输入框里已经是这段文字，不要覆盖
+     * @param {object} [anchor] 气泡锚点
+     * @param {{setEditor?: boolean, sourceRange?: Range|null}} [opts]
      */
-    async translate(text, rect, opts = {}) {
+    async translate(text, anchor, opts = {}) {
       const { setEditor = true } = opts;
+      if (opts.sourceRange !== undefined) {
+        this.sourceRange = opts.sourceRange;
+        this.lastRange = opts.sourceRange ? opts.sourceRange.cloneRange() : null;
+      }
       const maxLen = Number(this.settings.maxSelectionLength) || 600;
       const raw = String(text ?? '');
       const query = raw.length > maxLen ? raw.slice(0, maxLen) : raw;
       const truncated = query.length !== raw.length;
 
-      this.currentText = raw;
-      if (rect) this.anchor = rect;
-      const anchor = this.anchor || { left: 40, top: 60, bottom: 84, width: 120, height: 24 };
-      this.open = true;
-      const card = this._ensureCard(anchor);
+      if (this.closed) return;
+      if (anchor) this.anchor = anchor;
       if (setEditor && this.editor && this.editor.value !== raw) {
         this.editor.value = raw;
         this._autoGrow();
       }
       this._syncDirty();
-      place(card, anchor, { center: false });
+      this.placeAt(this.anchor);
       this._renderLoading(query, truncated);
 
-      const seq = (this._reqSeq = (this._reqSeq || 0) + 1);
+      const seq = (this.seq += 1);
       let res;
       try {
-        res = await this.onLookup(query, { truncated });
+        res = await this.bubble.onLookup(query, { truncated });
       } catch (err) {
         res = { ok: false, error: err?.message || String(err) };
       }
-      // 期间可能被关掉、或者用户又发起了新的翻译，只认最后一次
-      if (this.destroyed || this.card !== card || seq !== this._reqSeq) return;
+      // 期间可能被关掉、或者用户又改了词，只认最后一次请求
+      if (this.closed || seq !== this.seq) return;
       if (res && res.ok && res.result) this._renderResult(res.result, { query, truncated });
       else this._renderError(res?.error || '查询失败，请稍后重试', { query });
     }
@@ -1033,8 +967,8 @@
                 type: 'button',
                 title: '发音',
                 html: ICON.speaker,
-                onclick: (e) => {
-                  e.stopPropagation();
+                onclick: (event) => {
+                  event.stopPropagation();
                   this._play(audio);
                 },
               }),
@@ -1111,9 +1045,9 @@
           class: 'pdft-copy',
           type: 'button',
           text: '复制',
-          onclick: async (e) => {
-            e.stopPropagation();
-            const btn = e.currentTarget;
+          onclick: async (event) => {
+            event.stopPropagation();
+            const btn = event.currentTarget;
             const payload = isSentence
               ? r.translation || ''
               : [r.query, r.translation, ...(r.meanings || []).map((m) => `${m.pos} ${(m.defs || []).join('；')}`)]
@@ -1136,7 +1070,7 @@
             target: '_blank',
             rel: 'noreferrer noopener',
             text: '词典详情',
-            onclick: (e) => e.stopPropagation(),
+            onclick: (event) => event.stopPropagation(),
           }),
         );
       }
@@ -1146,7 +1080,7 @@
       foot.append(el('span', { class: 'pdft-engine', text: (r.engineLabel || r.engine || '') + (r.cached ? ' · 缓存' : '') }));
       box.append(foot);
 
-      if (this.card) place(this.card, this.anchor, { center: false });
+      this.placeAt();
     }
 
     /** 例句里高亮查询词（用 DOM 节点拼，不用 innerHTML） */
@@ -1181,7 +1115,359 @@
         /* 忽略发音失败 */
       }
     }
+
+    /** 关掉这张卡片（不动其它卡片） */
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      clearTimeout(this._noticeTimer);
+      clearTimeout(this._unpinHintTimer);
+      this.el.remove();
+    }
   }
 
-  globalThis.PDFT_BUBBLE = { TranslateBubble, cleanText, version: 1 };
+  /* ── 气泡管理器：选区检测、触发按钮、卡片集合 ───────────────── */
+  class TranslateBubble {
+    /**
+     * @param {object} opts
+     * @param {(text: string) => Promise<{ok: boolean, result?: object, error?: string}>} opts.onLookup
+     * @param {() => Promise<object>} [opts.loadSettings]
+     */
+    constructor(opts = {}) {
+      this.opts = opts;
+      this.onLookup = opts.onLookup;
+      this.settings = { maxSelectionLength: 600, showExamples: true, showPhonetic: true, viewerTheme: 'system' };
+      this.destroyed = false;
+      /** @type {BubbleCard[]} */
+      this.cards = [];
+      this.currentText = ''; // 最近一次选中的文字（右键菜单/快捷键兜底用）
+      this.anchor = null;
+      this._lastRange = null;
+      this._zTop = 10;
+      this._stackEl = null;
+      this._autoTimer = null;
+
+      this.host = document.createElement(HOST_TAG);
+      this.host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483600;';
+      this.shadow = this.host.attachShadow({ mode: 'open' });
+      this.shadow.append(el('style', { text: CSS }));
+      this.layer = el('div', { class: 'pdft-layer' });
+      this.shadow.append(this.layer);
+      (document.body || document.documentElement).append(this.host);
+
+      this._onMouseUp = this._onMouseUp.bind(this);
+      this._onMouseDown = this._onMouseDown.bind(this);
+      this._onKeyDown = this._onKeyDown.bind(this);
+      this._onViewportChange = this._onViewportChange.bind(this);
+    }
+
+    async init() {
+      if (this.opts.loadSettings) {
+        try {
+          const s = await this.opts.loadSettings();
+          if (s) this.settings = { ...this.settings, ...s };
+        } catch {
+          /* 用默认值 */
+        }
+      }
+      this.applyTheme();
+      return this;
+    }
+
+    applyTheme() {
+      const t = this.settings.viewerTheme;
+      if (t === 'light' || t === 'dark') this.layer.dataset.theme = t;
+      else delete this.layer.dataset.theme;
+    }
+
+    updateSettings(patch) {
+      this.settings = { ...this.settings, ...(patch || {}) };
+      this.applyTheme();
+    }
+
+    get enabled() {
+      return this.settings.enabled !== false;
+    }
+
+    attach() {
+      document.addEventListener('mouseup', this._onMouseUp, true);
+      document.addEventListener('mousedown', this._onMouseDown, true);
+      document.addEventListener('keydown', this._onKeyDown, true);
+      window.addEventListener('scroll', this._onViewportChange, true);
+      window.addEventListener('resize', this._onViewportChange, true);
+      return this;
+    }
+
+    destroy() {
+      this.destroyed = true;
+      document.removeEventListener('mouseup', this._onMouseUp, true);
+      document.removeEventListener('mousedown', this._onMouseDown, true);
+      document.removeEventListener('keydown', this._onKeyDown, true);
+      window.removeEventListener('scroll', this._onViewportChange, true);
+      window.removeEventListener('resize', this._onViewportChange, true);
+      clearTimeout(this._autoTimer);
+      this.closeAllCards();
+      this.host.remove();
+    }
+
+    /* ── 事件 ─────────────────────────────────────────────────── */
+    _inside(event) {
+      return event.composedPath ? event.composedPath().includes(this.host) : false;
+    }
+
+    _onMouseUp(event) {
+      if (this.destroyed || event.button !== 0) return;
+      if (this._inside(event)) return;
+      // 等浏览器把选区更新完
+      setTimeout(() => this._handleSelection(event), 0);
+    }
+
+    _onMouseDown(event) {
+      if (this.destroyed || this._inside(event)) return;
+      // 注意：这里只收按钮，不关卡片——卡片要能一直留着、能多开
+      this.hideButton();
+    }
+
+    _onKeyDown(event) {
+      if (event.key !== 'Escape') return;
+      // 正在输入框里打字时，Esc 只退出输入，不关卡片
+      const target = event.composedPath?.()[0];
+      if (target && (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT')) return;
+      this.hideButton();
+      this.closeTopCard();
+    }
+
+    _onViewportChange() {
+      this.hideButton();
+      for (const card of this.cards) {
+        if (card.pinned) continue;
+        const rect = card.liveRect();
+        if (rect) card.placeAt(rect);
+      }
+    }
+
+    _liveSelectionRect() {
+      try {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+        const r = sel.getRangeAt(0).getBoundingClientRect();
+        return r.width || r.height ? r : null;
+      } catch {
+        return null;
+      }
+    }
+
+    _liveSelectionRange() {
+      try {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+        return sel.getRangeAt(0);
+      } catch {
+        return null;
+      }
+    }
+
+    _handleSelection(event) {
+      if (this.destroyed || !this.enabled) return;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+      const text = cleanText(sel.toString());
+      if (!text) return;
+
+      // 光标的落点必须在选区附近，避免键盘/程序化选区误触发
+      const rect = this._liveSelectionRect();
+      if (!rect) return;
+      if (event && (event.clientX || event.clientY)) {
+        const pad = 24;
+        const near =
+          event.clientY >= rect.top - pad &&
+          event.clientY <= rect.bottom + pad &&
+          event.clientX >= rect.left - pad &&
+          event.clientX <= rect.right + pad;
+        if (!near) return;
+      }
+
+      const range = sel.getRangeAt(0);
+      this._lastRange = range.cloneRange();
+      this.currentText = text;
+      this.anchor = rect;
+      this.showButton(text, rect, range.cloneRange());
+    }
+
+    /** 供右键菜单 / 快捷键使用：直接对当前选区弹一张卡片 */
+    translateCurrentSelection() {
+      const sel = window.getSelection();
+      let text = cleanText(sel?.toString());
+      let rect = this._liveSelectionRect();
+      const range = this._liveSelectionRange();
+      if (range) this._lastRange = range.cloneRange();
+      if (!text && this.currentText) {
+        text = this.currentText;
+        rect = this.anchor;
+      }
+      if (!text) return false;
+      if (!rect) {
+        rect = { left: window.innerWidth / 2 - 60, top: 80, bottom: 104, width: 120, height: 24 };
+      }
+      this.hideButton();
+      this.openCard({ text, anchor: rect, sourceRange: range || this._lastRange });
+      return true;
+    }
+
+    /* ── 触发按钮 ─────────────────────────────────────────────── */
+    showButton(text, rect, sourceRange = null) {
+      if (!this.enabled) return;
+      this.currentText = text;
+      this.anchor = rect;
+      this.hideButton();
+      const btn = el(
+        'button',
+        {
+          class: 'pdft-btn',
+          type: 'button',
+          title: `翻译“${text.length > 24 ? text.slice(0, 24) + '…' : text}”`,
+          // 阻止默认行为，避免点击按钮时页面选中的高亮被清掉
+          onmousedown: (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          },
+        },
+        [el('span', { html: ICON.translate }), el('span', { text: '译' })],
+      );
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.hideButton();
+        this.openCard({ text, anchor: rect, sourceRange: sourceRange || this._lastRange });
+      });
+      this.button = btn;
+      this.layer.append(btn);
+      place(btn, rect, { center: true });
+
+      if (this.settings.translateOnSelect) {
+        clearTimeout(this._autoTimer);
+        this._autoTimer = setTimeout(() => {
+          this.hideButton();
+          this.openCard({ text, anchor: rect, auto: true, sourceRange: sourceRange || this._lastRange });
+        }, 260);
+      }
+    }
+
+    hideButton() {
+      clearTimeout(this._autoTimer);
+      if (this.button) {
+        this.button.remove();
+        this.button = null;
+      }
+    }
+
+    /* ── 卡片集合 ─────────────────────────────────────────────── */
+    /**
+     * 开一张新卡片（或复用上一张自动卡片）。
+     * @param {{text: string, anchor?: object, auto?: boolean, sourceRange?: Range|null}} init
+     */
+    openCard({ text, anchor, auto = false, sourceRange = null }) {
+      if (this.destroyed) return null;
+      const clean = cleanText(text);
+      if (!clean) return null;
+      const rect = anchor || this.anchor || { left: 40, top: 60, bottom: 84, width: 120, height: 24 };
+
+      // 「选中即译 / 双击即译」这种连续自动触发，复用上一张自动卡片，避免刷屏
+      if (auto) {
+        const reusable = [...this.cards].reverse().find((c) => c.auto && !c.pinned && !c.closed);
+        if (reusable) {
+          reusable.translate(clean, rect, { setEditor: true, sourceRange });
+          return reusable;
+        }
+      }
+
+      this._enforceLimit();
+      const card = new BubbleCard(this, { text: clean, anchor: rect, auto, sourceRange });
+      this.cards.push(card);
+      this.bringToFront(card);
+      this._avoidOverlap(card);
+      this._syncStack();
+      void card.translate(clean, rect, { setEditor: true });
+      return card;
+    }
+
+    /** 超过上限就关掉最早的（先关没被钉住的） */
+    _enforceLimit() {
+      while (this.cards.length >= MAX_CARDS) {
+        const victim = this.cards.find((c) => !c.pinned) || this.cards[0];
+        this.removeCard(victim);
+      }
+    }
+
+    /** 新卡片与已有卡片重叠时错开一点，让人一眼看出是两张 */
+    _avoidOverlap(card) {
+      // 卡片内容是异步填进来的，刚建好时还很矮，所以按「至少 260px 高」估一下更准
+      const box = (node, minHeight = 0) => {
+        const r = node.getBoundingClientRect();
+        return { left: r.left, top: r.top, right: r.right, bottom: r.top + Math.max(r.height, minHeight) };
+      };
+      const hits = (a, b) => !(a.right < b.left || a.left > b.right || a.bottom < b.top || a.top > b.bottom);
+      for (let step = 1; step <= 4; step += 1) {
+        const mine = box(card.el, 260);
+        const clash = this.cards.some(
+          (other) => other !== card && !other.closed && hits(mine, box(other.el, 120)),
+        );
+        if (!clash) return;
+        card.offset = { dx: 22 * step, dy: 26 * step };
+        card.placeAt();
+      }
+    }
+
+    bringToFront(card) {
+      if (!card || card.closed) return;
+      this._zTop += 1;
+      card.el.style.zIndex = String(this._zTop);
+    }
+
+    removeCard(card) {
+      if (!card || card.closed) return;
+      card.close();
+      this.cards = this.cards.filter((c) => c !== card);
+      this._syncStack();
+    }
+
+    /** Esc：关掉最上面那张 */
+    closeTopCard() {
+      if (!this.cards.length) return false;
+      const top = this.cards.reduce((a, b) =>
+        Number(a.el.style.zIndex || 0) >= Number(b.el.style.zIndex || 0) ? a : b,
+      );
+      this.removeCard(top);
+      return true;
+    }
+
+    closeAllCards() {
+      for (const card of [...this.cards]) card.close();
+      this.cards = [];
+      this._syncStack();
+    }
+
+    /** 角标：卡片 ≥ 2 张时出现，显示数量 + 一键全关 */
+    _syncStack() {
+      const count = this.cards.length;
+      if (count < 2) {
+        if (this._stackEl) {
+          this._stackEl.remove();
+          this._stackEl = null;
+        }
+        return;
+      }
+      if (!this._stackEl) {
+        this._stackEl = el('div', { class: 'pdft-stack' }, [
+          el('span', { class: 'pdft-stack-count' }),
+          el('button', { type: 'button', text: '全部关闭', onclick: () => this.closeAllCards() }),
+        ]);
+        this.layer.append(this._stackEl);
+      }
+      const label = this._stackEl.querySelector('.pdft-stack-count');
+      if (label) label.textContent = `${count} 张卡片 · 可拖动`;
+    }
+  }
+
+  globalThis.PDFT_BUBBLE = { TranslateBubble, BubbleCard, cleanText, version: 2 };
 })();

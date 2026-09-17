@@ -1,6 +1,6 @@
 {
   "name": "edge-pdf-huaci-translator",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Microsoft Edge 扩展：内置 PDF 阅读器 + 划词翻译（选中英文单词 → 点“译” → 中文释义）。",
   "license": "MIT",
